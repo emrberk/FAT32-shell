@@ -106,14 +106,14 @@ public:
     string name;
     string realName;
     FileNode* realNode;
-    bool isRead;
-    enum nodeType type;
+    enum nodeType type;             
     vector<unsigned>* clusterChain;
     FileNode* parentRef;
     unsigned firstClusterIndex;
     vector<FileNode*> children;
     FatFileEntry* entry;
     int order;
+    uint8_t checksum;
     uint16_t binaryModifiedDate;
     unsigned short modifiedDay;
     unsigned short modifiedYear;
@@ -125,17 +125,17 @@ public:
     uint8_t creationMs;
     unsigned fileSize;
     FileNode() {
-        isRead = false;
+        checksum = 0;
         clusterChain = nullptr;
         parentRef = nullptr;
         firstClusterIndex = 0;
+        fileSize = 0;
         entry = nullptr;
         realNode = nullptr;
         order = 0;
     }
-    FileNode(string name, bool isRead, enum nodeType type, vector<unsigned>* clusterChain, FileNode* parentRef, unsigned firstClusterIndex, vector<FileNode*> children, FatFileEntry* entry) :
+    FileNode(string name, enum nodeType type, vector<unsigned>* clusterChain, FileNode* parentRef, unsigned firstClusterIndex, vector<FileNode*> children, FatFileEntry* entry) :
         name(name),
-        isRead(isRead),
         type(type),
         clusterChain(clusterChain),
         parentRef(parentRef),
@@ -145,7 +145,7 @@ public:
     {}
     FileNode(const FileNode& base) {
         order = 0;
-        isRead = base.isRead;
+        fileSize = base.fileSize;
         type = base.type;
         clusterChain = base.clusterChain;
         parentRef = base.parentRef;
@@ -203,6 +203,16 @@ public:
 
 FileNode** fileTree = new FileNode*;
 
+bool isChild(FileNode* first, FileNode* second) {
+    bool cond = false;
+    for (auto& child : second->children) {
+        if (child->type != _DOT) {
+            cond = (child == first) || isChild(first, child);
+        }
+    }
+    return cond;
+}
+
 void updateFAT(FileNode* parentDirectory, deque<unsigned> newClusterIndices) {
     FILE* fp = fopen(imgFile, "r+");
     unsigned currentFATStart = FAT_START;
@@ -229,6 +239,88 @@ void updateFAT(FileNode* parentDirectory, deque<unsigned> newClusterIndices) {
     }
     fclose(fp);
 }
+
+void updateTimes(FileNode* parentDirectory, uint16_t date, uint16_t time) {
+    parentDirectory->setModifiedDate(date);
+    parentDirectory->setModifiedTime(time);
+    bool foundLfn = false;
+    bool completed = false;
+    FileNode* grandFather = parentDirectory->parentRef;
+    FILE* fpx = fopen(imgFile, "r+");
+    for (auto& cluster : *(grandFather->clusterChain)) {
+        for (int i = 0; i < CLUSTER_SIZE / sizeof(FatFileEntry) && !completed; i++) {
+            unsigned long offset = DATA_START + (cluster - 2) * CLUSTER_SIZE + i * sizeof(FatFileEntry);
+            fseek(fpx, offset, SEEK_SET);
+            FatFileEntry* entry = new FatFileEntry;
+            fread(entry, sizeof(FatFileEntry), 1, fpx);
+            if (entry->msdos.attributes == 0xF && entry->lfn.checksum == parentDirectory->checksum) {
+                foundLfn = true;
+            } else if (foundLfn && entry->msdos.attributes == 0x10) {
+                entry->msdos.modifiedDate = date;
+                entry->msdos.modifiedTime = time;
+                fseek(fpx, offset, SEEK_SET);
+                fwrite(entry, sizeof(FatFileEntry), 1, fpx);
+                completed = true;
+            }
+            delete entry;
+        }
+        if (completed) {
+            break;
+        }
+    }
+}
+/*
+bool updateParent(FileNode* file, int emptyClusterIndex) {
+    FILE* fp = fopen(imgFile, "r+");
+    unsigned numEntries = ceil(file->name.size() / 13.0) + 1;
+    if (emptyClusterIndex == 0) {
+        for (auto& parentCluster : *(file->parentRef->clusterChain)) {
+            for (int i = 0; i < CLUSTER_SIZE / sizeof(FatFileEntry); i++) {
+                FatFileEntry* buffer;
+                unsigned offset = DATA_START + (parentCluster - 2) * CLUSTER_SIZE + i * sizeof(FatFileEntry);
+                fseek(fp, offset, SEEK_SET);
+                fread(buffer, sizeof(FatFileEntry), 1, fp);
+                if (buffer->lfn.checksum == file->checksum) {
+                    numEntries--;
+                } else if (numEntries == 0 && emptyClusterIndex == 0) {
+                    // NECESSARY? buffer->msdos.lastAccessTime
+                    unsigned newStart = file->parentRef->clusterChain->at(1);
+                    buffer->msdos.eaIndex = (newStart & 0xFFFF0000) >> 16;
+                    buffer->msdos.firstCluster = (newStart & 0x0000FFFF);
+                    fseek(fp, offset, SEEK_SET);
+                    fwrite(buffer, sizeof(FatFileEntry), 1, fp);
+                }
+            }
+        }
+    }
+    if (emptyClusterIndex == -1) {
+        return true;
+    }
+    uint32_t zeroEntry = 0;
+    for (int i = 0; i < NUM_FATS; i++) {
+        fseek(fp, FAT_START + i * FAT_SIZE + file->clusterChain->at(emptyClusterIndex) * 4, SEEK_SET);
+        fwrite(&zeroEntry, 4, 1, fp);
+    }
+    if (emptyClusterIndex == 0) {
+        return true;
+    }
+    size_t parentCCSize = file->parentRef->clusterChain->size();
+    if (parentCCSize == 2) {
+        file->parentRef->clusterChain->erase(file->parentRef->clusterChain->begin() + emptyClusterIndex);
+        return true;
+    }
+    deque<unsigned> after;
+    for (int i = emptyClusterIndex + 1; i < parentCCSize; i++) {
+        after.push_back(file->parentRef->clusterChain->at(i));
+    }
+    for (int i = emptyClusterIndex; i < parentCCSize; i++) {
+        file->parentRef->clusterChain->erase(file->parentRef->clusterChain->begin() + i);
+    }
+    fclose(fp);
+    updateFAT(file->parentRef, after);
+    return true;
+}
+*/
 
 bool reserveNewCluster(FileNode* parentDirectory, unsigned remainingEntries) {
     unsigned neededClusters = remainingEntries / (CLUSTER_SIZE / sizeof(FatFileEntry)) + 1;
@@ -361,6 +453,7 @@ void getFileAndFolders(FileNode* root) {
     FILE* fp = fopen(imgFile, "r+");
     vector<unsigned>* clusterChain = root->clusterChain;
     string concatLfn = "";
+    uint8_t checksum = 0;
     for (auto& clusterIndex : *clusterChain) {
         unsigned offset = DATA_START + (clusterIndex - 2) * CLUSTER_SIZE;
         fseek(fp, offset, SEEK_SET);
@@ -393,6 +486,7 @@ void getFileAndFolders(FileNode* root) {
                     lfnName.push_back((char) fatFile->lfn.name3[j]);
                 }
                 concatLfn = lfnName + concatLfn;
+                checksum = fatFile->lfn.checksum;
             } else if (attributes == 0x10 || attributes == 0x20) { // 8.3 entry
                 for (int j = 0; j < 8; j++) {
                     if (!isascii(fatFile->msdos.filename[j]) || fatFile->msdos.filename[j] == 0 || fatFile->msdos.filename[j] == 32) {
@@ -402,15 +496,14 @@ void getFileAndFolders(FileNode* root) {
                 }
                 if (concatLfn.size()) { // end of LFN
                     uint32_t firstCluster = (fatFile->msdos.eaIndex << 16) + fatFile->msdos.firstCluster;
-
                     FileNode* newNode = new FileNode;
                     newNode->name = concatLfn;
                     newNode->parentRef = root;
-                    newNode->isRead = false;
                     newNode->type = attributes == 16 ? _FOLDER : _FILE;
                     newNode->firstClusterIndex = firstCluster;
                     newNode->clusterChain = getClusterChain(firstCluster);
                     newNode->entry = fatFile;
+                    newNode->checksum = checksum;
                     string order;
                     for (int i = 1; i < 8; i++) {
                         if (name83[i] == ' ' || name83[i] == 0) {
@@ -425,6 +518,7 @@ void getFileAndFolders(FileNode* root) {
                     newNode->creationMs = fatFile->msdos.creationTimeMs;
                     root->children.push_back(newNode);
                     concatLfn.erase();
+                    checksum = 0;
                 } else {
                     if (name83 == ".") {
                         FileNode* fptr = new FileNode(*root);
@@ -452,7 +546,6 @@ void getFileAndFolders(FileNode* root) {
 void createTree(FileNode* root) {
     if (root->type == _FOLDER) {
         getFileAndFolders(root);
-        root->isRead = true;
         for (auto& child : root->children) {
             createTree(child);
         }
@@ -464,7 +557,8 @@ FileNode* findFile(FileNode* currentDir, vector<string>& directories) {
     if (directories.size() == 0) {
         return nullptr;
     }
-    if (directories[0] == "/") { // absolute path
+
+    if (directories[0] == "/") {
         currentDir = *fileTree;
         directories.erase(directories.begin());
         if (directories.size() == 0) {
@@ -489,6 +583,12 @@ FileNode* findFile(FileNode* currentDir, vector<string>& directories) {
             } else if (child->type == _FILE && directories.size() == 1) {
                 return child;
             }
+        } else if (directories[0] == "." && currentDir->name == "/") {
+            if (directories.size() == 1) {
+                return currentDir;
+            }
+            vector<string> newVector(directories.begin() + 1, directories.end());
+            return findFile(currentDir, newVector);
         }
     }
     if (!found) {
@@ -745,6 +845,7 @@ FileNode* createChild(FileNode* parentDirectory, string name, enum nodeType type
     newDirNode->entry = msdos;
     entries[numLfnEntries] = msdos;
     uint8_t checksum = lfn_checksum(checkSumArg);
+    newDirNode->checksum = checksum;
     vector<uint16_t> padding;
     padding.reserve(13 * numLfnEntries);
     padding[name.size()] = 0x00;
@@ -780,6 +881,9 @@ FileNode* createChild(FileNode* parentDirectory, string name, enum nodeType type
         fwrite(entries[i], sizeof(FatFileEntry), 1, fpx);
     }
     fclose(fpx);
+    if (parentDirectory->name != "/") {
+        updateTimes(parentDirectory, creationDate, creationTime);   
+    }
     parentDirectory->children.push_back(newDirNode);
     if (type == _FOLDER) {
         bool created = createDotEntries(newDirNode);
@@ -816,13 +920,6 @@ int main(int argc, char** argv) {
     fread(&EOCVAL, 4, 1, fp2);
     fseek(fp2, FS_INFO_START + 488, SEEK_SET);
     fread(&FREE_CLUSTERS, 4, 1, fp2);
-    /*
-    cout << "data start = " << DATA_START << endl;
-    cout << "fat size = " << FAT_SIZE << endl;
-    cout << "numFATs = "<< NUM_FATS << endl;
-    cout << "fat start is " << FAT_START << endl;
-    cout << "cluster size is " << CLUSTER_SIZE << endl;
-    */
     fclose(fp2);
     string pwd = "/";
     FileNode* root = new FileNode;
@@ -830,10 +927,8 @@ int main(int argc, char** argv) {
     root->firstClusterIndex = bpb32->RootCluster;
     root->clusterChain = getClusterChain(root->firstClusterIndex); // will have memleak;
     root->type = _FOLDER;
-    root->isRead = false;
     const clock_t begin_time = clock();
     createTree(root);
-    cout << "CLOCK" << float( clock () - begin_time ) /  CLOCKS_PER_SEC << endl;
     *fileTree = root;
     string line;
     FileNode* currentDir = root;
@@ -848,22 +943,7 @@ int main(int argc, char** argv) {
             string arg1 = string(command[1]);
             vector<string> directories = extractDirectories(arg1);
             FileNode* directory = findFile(currentDir, directories);
-            /*
-            if (command[1] != "/") { // update last access time
-                FILE* fp1 = fopen(imgFile, "r+");
-                time_t now = time(0);
-                tm *tm = localtime(&now);
-                uint16_t creationTime = (tm->tm_hour << 11) + (tm->tm_min << 5) + tm->tm_sec / 2;
-                for (auto& cluster : *directory->parentRef->clusterChain) {
-                    FatFileEntry* fe = new FatFileEntry;
-                    fseek(fp1, DATA_START + cluster * CLUSTER_SIZE + directory->order * 32, SEEK_SET);
-                    fread(fe, sizeof(FatFileEntry), 1, fp1);
-                    fe->msdos.l
-                }
-                fclose(fp1);
-            }
-            */
-            if (directory != nullptr) {
+            if (directory != nullptr && directory->type == _FOLDER) {
                 pwd = findAbsolutePath(directory);
                 currentDir = directory;
             }
@@ -956,7 +1036,168 @@ int main(int argc, char** argv) {
                 delete c;
             }
             fclose(fp);
-        } else if (command[0] == "checksumtest") {
+        } else if (command[0] == "mv") {
+            // Find source & destination
+            vector<string> sourceDirectories = extractDirectories(command[1]);
+            vector<string> destinationDirectories = extractDirectories(command[2]);
+            FileNode* source = findFile(currentDir, sourceDirectories);
+            if (source == nullptr || source->type == _DOT || source->name == "/") {
+                continue;
+            }
+            FileNode* srcParent = source->parentRef;
+            FileNode* destinationFolder = findFile(currentDir, destinationDirectories);
+            if (destinationFolder == nullptr || srcParent == destinationFolder || isChild(destinationFolder, source)) {
+                continue;
+            }
+            bool parentContains = false;
+            for (auto& child: destinationFolder->children) {
+                if (child->name == source->name) {
+                    parentContains = true;
+                    break;
+                }
+            }
+            if (parentContains) {
+                continue;
+            }
+            // Take FatFileEntries from source parent directory and set spaces to ZERO_ENTRY
+            unsigned numEntries = ceil(source->name.size() / 13.0) + 1;
+            vector<FatFileEntry> sourceEntries;
+            FILE* fp = fopen(imgFile, "r+");
+            bool insideSourceEntries = false;
+            bool completed = false;
+            int j = 0;
+            unsigned lastCluster = -1;
+            int lastClusterIndex = -1;
+            for (auto& cluster : *(srcParent->clusterChain)) {
+                for (int i = 0; i < CLUSTER_SIZE / sizeof(FatFileEntry) && !completed; i++) {
+                    unsigned long offset = DATA_START + (cluster - 2) * CLUSTER_SIZE + i * sizeof(FatFileEntry);
+                    FatFileEntry* buffer = new FatFileEntry;
+                    fseek(fp, offset, SEEK_SET);
+                    fread(buffer, sizeof(FatFileEntry), 1, fp);
+                    if (insideSourceEntries) {
+                        sourceEntries.push_back(*buffer);
+                        fseek(fp, offset, SEEK_SET);
+                        fwrite(ZERO_ENTRY, sizeof(FatFileEntry), 1, fp);
+                        if (sourceEntries.size() == numEntries) {
+                            lastClusterIndex = j;
+                            lastCluster = cluster;
+                            completed = true;
+                        }
+                    } else if (buffer->msdos.attributes != 0xE5 && buffer->lfn.checksum == source->checksum) {
+                        sourceEntries.push_back(*buffer);
+                        fseek(fp, offset, SEEK_SET);
+                        fwrite(ZERO_ENTRY, sizeof(FatFileEntry), 1, fp);
+                        insideSourceEntries = true;
+                    }
+                    delete buffer;
+                }
+                if (completed) {
+                    break;
+                }
+                j++;
+            }
+            if (lastCluster == -1) {
+                continue;
+            }
+            /*
+             If parent cluster became empty, deallocate it 
+            bool fullEmpty = true;
+            for (int i = 0; i < CLUSTER_SIZE / sizeof(FatFileEntry); i++) {
+                FatFileEntry* buffer = new FatFileEntry;
+                unsigned long offset = DATA_START + (lastCluster - 2) * CLUSTER_SIZE + i * sizeof(FatFileEntry);
+                fseek(fp, offset, SEEK_SET);
+                fread(buffer, sizeof(FatFileEntry), 1, fp);
+                if (buffer->msdos.attributes != 0) {
+                    fullEmpty = false;
+                    break;
+                }
+            }
+            if (fullEmpty && srcParent->clusterChain->size() > 1 && srcParent->name != "/") { // full empty and can be shrinked
+                updateParent(srcParent, lastClusterIndex);
+            }
+            */
+            uint16_t currDate = getCurrentDate();
+            uint16_t currTime = getCurrentTime();
+            fclose(fp);
+            if (srcParent->name != "/") {
+                updateTimes(srcParent, currDate, currTime);
+            }
+            // Update source parent directory FileNode
+            for (int i = 0; i < srcParent->children.size(); i++) {
+                if (srcParent->children[i]->name == source->name) {
+                    srcParent->children.erase(srcParent->children.begin() + i);
+                    break;
+                }
+            }
+            // Update source FatFileEntries
+
+            // Update source/..
+            fp = fopen(imgFile, "r+");
+            FatFileEntry* twoDot = new FatFileEntry;
+            unsigned firstCluster = source->clusterChain->at(0);
+            unsigned long offset = DATA_START + (firstCluster - 2) * CLUSTER_SIZE + sizeof(FatFileEntry);
+            fseek(fp, offset, SEEK_SET);
+            fread(twoDot, sizeof(FatFileEntry), 1, fp);
+            unsigned parentFirstCluster = destinationFolder->clusterChain->at(0);
+            twoDot->msdos.eaIndex = (parentFirstCluster & 0xFFFF0000) >> 16;
+            twoDot->msdos.firstCluster = (parentFirstCluster & 0x0000FFFF);
+            fseek(fp, offset, SEEK_SET);
+            fwrite(twoDot, sizeof(FatFileEntry), 1, fp);
+            delete twoDot;
+            fclose(fp);
+            // Update source FileNode
+            source->parentRef = destinationFolder;
+            source->order = destinationFolder->getMaxOrder() + 1;
+            if (source->type == _FOLDER) {
+                for (auto& child : source->children) {
+                    if (child->name == "..") {
+                        child->realNode = destinationFolder;
+                        child->realName = destinationFolder->name;
+                        break;
+                    }
+                }
+            }
+            uint8_t* new83Name = new uint8_t[8];
+            new83Name[0] = 0x7E;
+            string orderStr = to_string(source->order);
+            for (int i = 0; i < orderStr.size(); i++) {
+                new83Name[i + 1] = orderStr[i];
+            }
+            for (int i = orderStr.size() + 1; i < 8; i++) {
+                new83Name[i] = ' ';
+            }
+            for (int i = 0; i < 8; i++) {
+                sourceEntries[sourceEntries.size() - 1].msdos.filename[i] = new83Name[i];
+            }
+            char* new83Char = new char[11];
+            for (int i = 0; i < 8; i++) {
+                new83Char[i] = new83Name[i];
+            }
+            for (int i = 0; i < 3; i++) {
+                new83Char[i + 8] = 0x20; 
+            }
+            uint8_t checksum = lfn_checksum(new83Char);
+            for (int i = 0; i < sourceEntries.size() - 1; i++) {
+                sourceEntries[i].lfn.checksum = checksum;
+            }
+            delete[] new83Char;
+            // Place FatFileEntries under destination
+            vector<unsigned> addresses = getAvailableAddresses(destinationFolder, numEntries);
+            fp = fopen(imgFile, "r+");
+            for (int i = 0; i < addresses.size(); i++) {
+                fseek(fp, addresses[i], SEEK_SET);
+                fwrite(&(sourceEntries[i]), sizeof(FatFileEntry), 1, fp);
+            }
+            fclose(fp);
+            if (destinationFolder->name != "/") {
+                updateTimes(destinationFolder, currDate, currTime);
+            }
+            // Update destination parent directory FileNode
+            destinationFolder->children.push_back(source);
+
+        } 
+        
+        else if (command[0] == "checksumtest") {
             char testsum[11];
             testsum[0] = fileTree[0]->children[0]->entry->msdos.filename[0];
             cout << "00 name = " << fileTree[0]->children[0]->name << endl;
@@ -974,6 +1215,7 @@ int main(int argc, char** argv) {
         } else if (command[0] == "printcc") {
             printFatEntries(currentDir);
         }
+        
 
     }
 

@@ -73,7 +73,7 @@ uint16_t getCurrentTime() {
 
 uint8_t lfn_checksum(char *pFCBName) {
    int i;
-   unsigned char sum = 0;
+   uint8_t sum = 0;
    for (i = 11; i; i--)
       sum = ((sum & 1) << 7) + (sum >> 1) + *pFCBName++;
 
@@ -536,7 +536,7 @@ void getFileAndFolders(FileNode* root) {
                         root->children.push_back(fptr);
                     }
                 } 
-            } // else if (attributes == )
+            }
             delete fatFile;
         }
     }
@@ -1195,9 +1195,7 @@ int main(int argc, char** argv) {
             // Update destination parent directory FileNode
             destinationFolder->children.push_back(source);
 
-        } 
-        
-        else if (command[0] == "checksumtest") {
+        } else if (command[0] == "checksumtest") {
             char testsum[11];
             testsum[0] = fileTree[0]->children[0]->entry->msdos.filename[0];
             cout << "00 name = " << fileTree[0]->children[0]->name << endl;
@@ -1215,7 +1213,6 @@ int main(int argc, char** argv) {
         } else if (command[0] == "printcc") {
             printFatEntries(currentDir);
         }
-        
 
     }
 
